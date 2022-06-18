@@ -1,0 +1,195 @@
+Parameters:
+  StudentName:
+    Description: My surname that will be prefixed to resource names
+    Type: String
+  WebAppAMI:
+    Description: AMI for the web servers in the configuration
+    Type: String
+  BastionAMI:
+    Description: AMI for the Bastion host
+    Type: String
+
+Resources:
+  ELBSG: #my load balancer security group
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our load balancer
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${StudentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 8080
+        ToPort: 8080
+        CidrIp: 0.0.0.0/0
+
+  WebServerSG: #Web server security group
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our hosts and SSH from local only
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${StudentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 8080
+        ToPort: 8080
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp #Enable ssh for bastion host only
+        FromPort: 22
+        ToPort: 22
+        SourceSecurityGroupId: !Ref 'BastionSG'
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 0
+        ToPort: 65535
+        CidrIp: 0.0.0.0/0
+
+  WebAppLaunchConfig: # My launch configuration
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt-get update -y
+          apt-get install apache2 -y
+          systemctl start apache2.service
+          cd /var/www/html
+          echo "it works! Udagram, Udacity" > index.html       
+      ImageId: !Ref WebAppAMI
+      SecurityGroups:
+      - Ref: WebServerSG
+      InstanceType: t3.medium
+      BlockDeviceMappings:
+      - DeviceName: "/dev/sdk"
+        Ebs:
+          VolumeSize: '10'
+
+  WebAppGroup: # Autoscaling Group
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+      - Fn::ImportValue: 
+          !Sub "${StudentName}-PRIV-NETS"
+      LaunchConfigurationName:
+        Ref: WebAppLaunchConfig
+      MinSize: '4'
+      MaxSize: '5'
+      TargetGroupARNs:
+      - Ref: WebAppTargetGroup
+
+  WebAppLB:  # Load Balancer
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - Fn::ImportValue: !Sub "${StudentName}-PUB1-SN"
+      - Fn::ImportValue: !Sub "${StudentName}-PUB2-SN"
+      SecurityGroups:
+      - Ref: ELBSG
+
+  Listener: # Listener
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: WebAppTargetGroup
+      LoadBalancerArn:
+        Ref: WebAppLB
+      Port: '80'
+      Protocol: HTTP
+  ALBListenerRule:
+      Type: AWS::ElasticLoadBalancingV2::ListenerRule
+      Properties:
+        Actions:
+        - Type: forward
+          TargetGroupArn: !Ref 'WebAppTargetGroup'
+        Conditions:
+        - Field: path-pattern
+          Values: [/]
+        ListenerArn: !Ref 'Listener'
+        Priority: 1
+  WebAppTargetGroup: # Target Group
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 8
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId: 
+        Fn::ImportValue:
+          Fn::Sub: "${StudentName}-VPCID"
+
+  BastionSG: #Bastion security group
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow ssh for bastion host
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${StudentName}-VPCID"
+      SecurityGroupIngress: #Enable ssh only
+      - IpProtocol: tcp  
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 62.8.86.42/32 # My local machine's IP
+  
+  Bastion: # Bastion Host
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref BastionAMI
+      InstanceType: t2.micro
+      Tags: 
+        - Key: Name 
+          Value: !Sub ${StudentName} Bastion
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet:
+            - Ref: "BastionSG"
+          SubnetId:
+            Fn::ImportValue: !Sub "${StudentName}-PUB1-SN"
+
+  RolesS3andSSMAccess:  # Roles for S3 and SSM access
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  SSMInstanceProfile: 
+    Type: "AWS::IAM::InstanceProfile"
+    Properties: 
+      Roles: 
+        - !Ref RolesS3andSSMAccess
+
+Outputs: #DNS Name
+  LoadBalancerDNSName:
+    Value: !Join [ "", [ 'http://', !GetAtt WebAppLB.DNSName ]]
+    Export:
+      Name: "DNS-URL" 
